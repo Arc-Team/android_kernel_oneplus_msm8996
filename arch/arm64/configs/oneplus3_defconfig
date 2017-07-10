@@ -1,6 +1,6 @@
 #
 # Automatically generated file; DO NOT EDIT.
-# Linux/arm64 3.18.31-LA.UM.5.5.r1-04700-8x96.0 Kernel Configuration
+# Linux/arm64 3.18.31-LA.UM.5.5.r1-05100-8x96.0 Kernel Configuration
 #
 CONFIG_ARM64=y
 CONFIG_64BIT=y
@@ -109,7 +109,9 @@ CONFIG_RCU_FANOUT_LEAF=16
 # CONFIG_RCU_FANOUT_EXACT is not set
 CONFIG_RCU_FAST_NO_HZ=y
 # CONFIG_TREE_RCU_TRACE is not set
-# CONFIG_RCU_BOOST is not set
+CONFIG_RCU_BOOST=y
+CONFIG_RCU_BOOST_PRIO=1
+CONFIG_RCU_BOOST_DELAY=500
 # CONFIG_RCU_NOCB_CPU is not set
 # CONFIG_BUILD_BIN2C is not set
 # CONFIG_IKCONFIG is not set
@@ -1053,7 +1055,6 @@ CONFIG_NFC=y
 #
 # CONFIG_NFC_PN533 is not set
 # CONFIG_NFC_SIM is not set
-# CONFIG_NFC_PN544 is not set
 CONFIG_NFC_PN544_OP=y
 # CONFIG_NFC_NQ is not set
 CONFIG_IPC_ROUTER=y
