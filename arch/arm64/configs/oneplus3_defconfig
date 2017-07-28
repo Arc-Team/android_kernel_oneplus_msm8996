@@ -1,6 +1,6 @@
 #
 # Automatically generated file; DO NOT EDIT.
-# Linux/arm64 3.18.31-LA.UM.5.5.r1-05100-8x96.0 Kernel Configuration
+# Linux/arm64 3.18.31-LA.UM.5.5.r1-05300-8x96.0 Kernel Configuration
 #
 CONFIG_ARM64=y
 CONFIG_64BIT=y
