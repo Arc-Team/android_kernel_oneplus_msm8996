@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2017 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2018 The Linux Foundation. All rights reserved.
  *
  * Previously licensed under the ISC license by Qualcomm Atheros, Inc.
  *
@@ -33,6 +33,7 @@
 #include <linux/mmc/sdio.h>
 #include <linux/mmc/sd.h>
 #include <linux/kthread.h>
+#include <linux/pm_qos.h>
 #include "vos_cnss.h"
 #include "if_ath_sdio.h"
 #include "regtable.h"
@@ -81,6 +82,11 @@ struct bus_request_record bus_request_record_buf[BUS_REQ_RECORD_SIZE];
 #ifdef HIF_MBOX_SLEEP_WAR
 #define HIF_MIN_SLEEP_INACTIVITY_TIME_MS     50
 #define HIF_SLEEP_DISABLE_UPDATE_DELAY 1
+#define HIF_CIS_RTC_STATE_ADDR 0x1138
+#define HIF_CIS_RTC_STATE_ON 0x01
+#define HIF_CIS_READ_WAIT_4_RTC_CYCLE_IN_US 125
+#define HIF_CIS_XTAL_SETTLE_DURATION_IN_US 1500
+#define HIF_CIS_READ_RETRY 10
 #define HIF_IS_WRITE_REQUEST_MBOX1_TO_3(request) \
                 ((request->request & HIF_WRITE)&& \
                 (request->address >= 0x1000 && request->address < 0x1FFFF))
@@ -882,12 +888,18 @@ static inline void hif_free_bus_request(HIF_DEVICE *device,
  */
 static inline int hif_start_tx_completion_thread(HIF_DEVICE *device)
 {
+#ifdef CONFIG_PERF_NON_QC_PLATFORM
+	struct sched_param param = {.sched_priority = 99};
+#endif
 	if (!device->tx_completion_task) {
 		device->tx_completion_req = NULL;
 		device->last_tx_completion = &device->tx_completion_req;
 		device->tx_completion_shutdown = 0;
 		device->tx_completion_task = kthread_create(tx_completion_task,
 			(void *)device,	"AR6K TxCompletion");
+#ifdef CONFIG_PERF_NON_QC_PLATFORM
+		sched_setscheduler(device->tx_completion_task, SCHED_FIFO, &param);
+#endif
 		if (IS_ERR(device->tx_completion_task)) {
 			device->tx_completion_shutdown = 1;
 			AR_DEBUG_PRINTF(ATH_DEBUG_ERROR,
@@ -1497,9 +1509,25 @@ HIF_sleep_entry(void *arg)
     }
 }
 
+static int HIFReadRTCState(HIF_DEVICE *device, unsigned char *state)
+{
+	unsigned char rtc_state = 0;
+	int ret = 0;
+
+	rtc_state = sdio_f0_readb(device->func, HIF_CIS_RTC_STATE_ADDR, &ret);
+	if (ret)
+		return ret;
+	*state = rtc_state & 0x3;
+
+	return ret;
+}
+
 void
 HIFSetMboxSleep(HIF_DEVICE *device, bool sleep, bool wait, bool cache)
 {
+    unsigned char rtc_state = 0;
+    int ret = 0, retry = 0;
+
     if (!device || !device->func|| !device->func->card) {
         printk("HIFSetMboxSleep incorrect input arguments\n");
         return;
@@ -1521,11 +1549,27 @@ HIFSetMboxSleep(HIF_DEVICE *device, bool sleep, bool wait, bool cache)
     __HIFReadWrite(device, FIFO_TIMEOUT_AND_CHIP_CONTROL,
                    (A_UCHAR*)&device->init_sleep, 4,
                    HIF_WR_SYNC_BYTE_INC, NULL);
-    sdio_release_host(device->func);
-     /*Wait for 1ms for the written value to take effect */
-    if (wait) {
-       adf_os_mdelay(HIF_SLEEP_DISABLE_UPDATE_DELAY);
+    /* Check RTC state_on before sending data, only do this for wakeup */
+    if (!sleep && wait) {
+        while(1) {
+            AR_DEBUG_ASSERT(retry < HIF_CIS_READ_RETRY);
+
+            /* Wait 4 RTC cycle before read CIS */
+            adf_os_udelay(HIF_CIS_READ_WAIT_4_RTC_CYCLE_IN_US);
+
+            ret = HIFReadRTCState(device, &rtc_state);
+            if(ret) {
+                printk("Read CIS failure\n");
+                break;
+            }
+            if (rtc_state == HIF_CIS_RTC_STATE_ON)
+                break;
+            /* Wait XTAL_SETTLE before read CIS next time */
+            adf_os_udelay(HIF_CIS_XTAL_SETTLE_DURATION_IN_US);
+            retry++;
+        }
     }
+    sdio_release_host(device->func);
     return;
 }
 #endif
@@ -2030,7 +2074,9 @@ static A_STATUS hifDisableFunc(HIF_DEVICE *device, struct sdio_func *func)
 static A_STATUS hifEnableFunc(HIF_DEVICE *device, struct sdio_func *func)
 {
     int ret = A_OK;
-
+#ifdef CONFIG_PERF_NON_QC_PLATFORM
+    struct sched_param param = {.sched_priority = 99};
+#endif
     ENTER("sdio_func 0x%pK", func);
 
     AR_DEBUG_PRINTF(ATH_DEBUG_TRACE, ("AR6000: +hifEnableFunc\n"));
@@ -2142,6 +2188,9 @@ static A_STATUS hifEnableFunc(HIF_DEVICE *device, struct sdio_func *func)
             device->async_task = kthread_create(async_task,
                                            (void *)device,
                                            "AR6K Async");
+#ifdef CONFIG_PERF_NON_QC_PLATFORM
+           sched_setscheduler(device->async_task, SCHED_FIFO, &param);
+#endif
            if (IS_ERR(device->async_task)) {
                AR_DEBUG_PRINTF(ATH_DEBUG_ERROR, ("AR6000: %s(), to create async task\n", __FUNCTION__));
                device->async_task = NULL;
@@ -2884,16 +2933,25 @@ static void hif_sdio_device_removed(struct sdio_func *func)
 
 static int hif_sdio_device_reinit(struct sdio_func *func, const struct sdio_device_id * id)
 {
+	int ret;
+
 	if (vos_is_load_unload_in_progress(VOS_MODULE_ID_HIF, NULL) &&
 	    !vos_is_logp_in_progress(VOS_MODULE_ID_VOSS, NULL)) {
 		printk("%s: Load/unload is in progress and SSR is not,"
 		       "ignore SSR reinit...\n", __func__);
 		return 0;
 	}
-	if ((func != NULL) && (id != NULL))
-		return hifDeviceInserted(func, id);
-	else
+
+	if ((func != NULL) && (id != NULL)) {
+		vos_request_pm_qos_type(PM_QOS_CPU_DMA_LATENCY,
+					DISABLE_KRAIT_IDLE_PS_VAL);
+		ret = hifDeviceInserted(func, id);
+		vos_remove_pm_qos();
+
+		return ret;
+	} else {
 		printk("%s: Invalid sdio func and device id. Card removed?\n", __func__);
+	}
 
 	return -ENODEV;
 }

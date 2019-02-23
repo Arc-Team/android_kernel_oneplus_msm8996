@@ -1464,25 +1464,14 @@ hdd_update_chandef(hdd_adapter_t *hostapd_adapter,
 }
 #endif
 
-/**
- * hdd_chan_change_notify() - Function to notify hostapd about channel change
- * @hostapd_adapter	hostapd adapter
- * @dev:		Net device structure
- * @oper_chan:		New operating channel
- *
- * This function is used to notify hostapd about the channel change
- *
- * Return: Success on intimating userspace
- *
- */
 VOS_STATUS hdd_chan_change_notify(hdd_adapter_t *hostapd_adapter,
 		struct net_device *dev,
-		uint8_t oper_chan)
+		uint8_t oper_chan,
+		eCsrPhyMode phy_mode)
 {
 	struct ieee80211_channel *chan;
 	struct cfg80211_chan_def chandef;
 	enum nl80211_channel_type channel_type;
-	eCsrPhyMode phy_mode;
 	ePhyChanBondState cb_mode;
 	uint32_t freq;
 	tHalHandle  hal = WLAN_HDD_GET_HAL_CTX(hostapd_adapter);
@@ -1495,21 +1484,17 @@ VOS_STATUS hdd_chan_change_notify(hdd_adapter_t *hostapd_adapter,
 
 	freq = vos_chan_to_freq(oper_chan);
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0))
+	chan = ieee80211_get_channel(hostapd_adapter->wdev.wiphy, freq);
+#else
 	chan = __ieee80211_get_channel(hostapd_adapter->wdev.wiphy, freq);
-
+#endif
 	if (!chan) {
 		VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
 				"%s: Invalid input frequency for channel conversion",
 				 __func__);
 		return VOS_STATUS_E_FAILURE;
 	}
-
-#ifdef WLAN_FEATURE_MBSSID
-	phy_mode = wlansap_get_phymode(WLAN_HDD_GET_SAP_CTX_PTR(hostapd_adapter));
-#else
-	phy_mode = wlansap_get_phymode(
-			(WLAN_HDD_GET_CTX(hostapd_adapter))->pvosContext);
-#endif
 
 	if (oper_chan <= 14)
 		cb_mode = sme_GetCBPhyStateFromCBIniValue(
@@ -3079,9 +3064,18 @@ VOS_STATUS hdd_hostapd_SAPEventCB( tpSap_Event pSapEvent, v_PVOID_t usrDataForCa
             if (pHostapdAdapter->device_mode == WLAN_HDD_SOFTAP &&
                                                pHddCtx->cfg_ini->force_sap_acs)
                 return VOS_STATUS_SUCCESS;
-            else
+            else {
+                eCsrPhyMode phy_mode;
+#ifdef WLAN_FEATURE_MBSSID
+                phy_mode = wlansap_get_phymode(
+                              WLAN_HDD_GET_SAP_CTX_PTR(pHostapdAdapter));
+#else
+                phy_mode = wlansap_get_phymode(
+                              (WLAN_HDD_GET_CTX(pHostapdAdapter))->pvosContext);
+#endif
                 return hdd_chan_change_notify(pHostapdAdapter, dev,
-                           pSapEvent->sapevt.sapChSelected.pri_ch);
+                           pSapEvent->sapevt.sapChSelected.pri_ch, phy_mode);
+            }
         case eSAP_ACS_SCAN_SUCCESS_EVENT:
             return hdd_handle_acs_scan_event(pSapEvent, pHostapdAdapter);
         case eSAP_DFS_NOL_GET:
@@ -3225,17 +3219,18 @@ int hdd_softap_unpackIE(
 
     tANI_U8 *pRsnIe;
     tANI_U16 RSNIeLen;
+    tANI_U32 status;
 
     if (NULL == halHandle)
     {
         hddLog(LOGE, FL("Error haHandle returned NULL"));
-        return -EINVAL;
+        return VOS_STATUS_E_FAILURE;
     }
 
     // Validity checks
     if ((gen_ie_len < VOS_MIN(DOT11F_IE_RSN_MIN_LEN, DOT11F_IE_WPA_MIN_LEN)) ||
         (gen_ie_len > VOS_MAX(DOT11F_IE_RSN_MAX_LEN, DOT11F_IE_WPA_MAX_LEN)) )
-        return -EINVAL;
+        return VOS_STATUS_E_FAILURE;
     // Type check
     if ( gen_ie[0] ==  DOT11F_EID_RSN)
     {
@@ -3250,20 +3245,29 @@ int hdd_softap_unpackIE(
         RSNIeLen = gen_ie_len - 2;
         // Unpack the RSN IE
         memset(&dot11RSNIE, 0, sizeof(tDot11fIERSN));
-        dot11fUnpackIeRSN((tpAniSirGlobal) halHandle,
-                            pRsnIe,
-                            RSNIeLen,
-                            &dot11RSNIE);
+
+        status = sme_unpack_rsn_ie(halHandle,
+                                   pRsnIe,
+                                   RSNIeLen,
+                                   &dot11RSNIE);
+        if (DOT11F_FAILED(status))
+        {
+            hddLog(LOGE,
+            FL("unpack failed for RSN IE status:(0x%08x)"),
+               status);
+            return VOS_STATUS_E_FAILURE;
+        }
+
         // Copy out the encryption and authentication types
         hddLog(LOG1, FL("%s: pairwise cipher suite count: %d"),
                 __func__, dot11RSNIE.pwise_cipher_suite_count );
         hddLog(LOG1, FL("%s: authentication suite count: %d"),
-                __func__, dot11RSNIE.akm_suite_count);
+                __func__, dot11RSNIE.akm_suite_cnt);
         /*Here we have followed the apple base code,
           but probably I suspect we can do something different*/
-        //dot11RSNIE.akm_suite_count
+        //dot11RSNIE.akm_suite_cnt
         // Just translate the FIRST one
-        *pAuthType =  hdd_TranslateRSNToCsrAuthType(dot11RSNIE.akm_suites[0]);
+        *pAuthType =  hdd_TranslateRSNToCsrAuthType(dot11RSNIE.akm_suite[0]);
         //dot11RSNIE.pwise_cipher_suite_count
         *pEncryptType = hdd_TranslateRSNToCsrEncryptionType(dot11RSNIE.pwise_cipher_suites[0]);
         //dot11RSNIE.gp_cipher_suite_count
@@ -3286,11 +3290,19 @@ int hdd_softap_unpackIE(
         RSNIeLen = gen_ie_len - (2 + 4);
         // Unpack the WPA IE
         memset(&dot11WPAIE, 0, sizeof(tDot11fIEWPA));
-        dot11fUnpackIeWPA((tpAniSirGlobal) halHandle,
+        status = dot11fUnpackIeWPA((tpAniSirGlobal) halHandle,
                             pRsnIe,
                             RSNIeLen,
                             &dot11WPAIE);
-        // Copy out the encryption and authentication types
+        if (DOT11F_FAILED(status))
+        {
+             hddLog(LOGE,
+                    FL("unpack failed for WPA IE status:(0x%08x)"),
+                    status);
+             return VOS_STATUS_E_FAILURE;
+        }
+
+       // Copy out the encryption and authentication types
         hddLog(LOG1, FL("%s: WPA unicast cipher suite count: %d"),
                 __func__, dot11WPAIE.unicast_cipher_count );
         hddLog(LOG1, FL("%s: WPA authentication suite count: %d"),
@@ -3787,11 +3799,13 @@ static __iw_softap_wowl_config_pattern(struct net_device *dev,
     {
     case WE_WOWL_ADD_PTRN:
         VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO, "ADD_PTRN");
-        hdd_add_wowl_ptrn(pAdapter, pBuffer);
+        if (!hdd_add_wowl_ptrn(pAdapter, pBuffer))
+            ret = -EINVAL;
         break;
     case WE_WOWL_DEL_PTRN:
         VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO, "DEL_PTRN");
-        hdd_del_wowl_ptrn(pAdapter, pBuffer);
+        if (!hdd_del_wowl_ptrn(pAdapter, pBuffer))
+            ret = -EINVAL;
         break;
     default:
         hddLog(LOGE, "%s: Invalid sub command %d", __func__, sub_cmd);
@@ -6320,58 +6334,6 @@ static int iw_get_ap_freq(struct net_device *dev,
 	return ret;
 }
 
-/**
- * __iw_get_mode() - get mode
- * @dev - Pointer to the net device.
- * @info - Pointer to the iw_request_info.
- * @wrqu - Pointer to the iwreq_data.
- * @extra - Pointer to the data.
- *
- * Return: 0 for success, non zero for failure.
- */
-static int __iw_get_mode(struct net_device *dev,
-                         struct iw_request_info *info,
-                         union iwreq_data *wrqu,
-                         char *extra)
-{
-    hdd_adapter_t *adapter;
-    hdd_context_t *hdd_ctx;
-    int ret;
-
-    adapter = WLAN_HDD_GET_PRIV_PTR(dev);
-    hdd_ctx = WLAN_HDD_GET_CTX(adapter);
-    ret = wlan_hdd_validate_context(hdd_ctx);
-    if (0 != ret)
-        return ret;
-
-    wrqu->mode = IW_MODE_MASTER;
-
-    return ret;
-}
-
-/**
- * iw_get_mode() - Wrapper function to protect __iw_get_mode from the SSR.
- * @dev - Pointer to the net device.
- * @info - Pointer to the iw_request_info.
- * @wrqu - Pointer to the iwreq_data.
- * @extra - Pointer to the data.
- *
- * Return: 0 for success, non zero for failure.
- */
-static int iw_get_mode(struct net_device *dev,
-                       struct iw_request_info *info,
-                       union iwreq_data *wrqu, char *extra)
-{
-        int ret;
-
-        vos_ssr_protect(__func__);
-        ret = __iw_get_mode(dev, info, wrqu, extra);
-        vos_ssr_unprotect(__func__);
-
-        return ret;
-}
-
-
 static int __iw_softap_stopbss(struct net_device *dev,
                              struct iw_request_info *info,
                              union iwreq_data *wrqu,
@@ -6757,7 +6719,7 @@ VOS_STATUS  wlan_hdd_get_linkspeed_for_peermac(hdd_adapter_t *pAdapter,
       goto cleanup;
    }
    ret = hdd_request_wait_for_response(request);
-   if (!ret) {
+   if (ret) {
       hddLog(VOS_TRACE_LEVEL_ERROR,
              "%s: SME timed out while retrieving link speed,ret(%d)",
              __func__, ret);
@@ -7147,7 +7109,7 @@ static const iw_handler      hostapd_handler[] =
    (iw_handler) NULL,           /* SIOCSIWFREQ */
    (iw_handler) iw_get_ap_freq,    /* SIOCGIWFREQ */
    (iw_handler) NULL,           /* SIOCSIWMODE */
-   (iw_handler) iw_get_mode,    /* SIOCGIWMODE */
+   (iw_handler) NULL,           /* SIOCGIWMODE */
    (iw_handler) NULL,           /* SIOCSIWSENS */
    (iw_handler) NULL,           /* SIOCGIWSENS */
    (iw_handler) NULL,           /* SIOCSIWRANGE */
@@ -7679,6 +7641,14 @@ static const struct iw_priv_args hostapd_private_args[] = {
     {   QCSAP_IOCTL_DUMP_DP_TRACE_LEVEL,
         IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 2,
         0, "dump_dp_trace" },
+
+    {   WE_SET_THERMAL_THROTTLE_CONFIG,
+        IW_PRIV_TYPE_INT | MAX_VAR_ARGS,
+        0, "setThermalConfig" },
+
+    {   WE_SET_HPCS_PULSE_PARAMS_CONFIG,
+        IW_PRIV_TYPE_INT | MAX_VAR_ARGS,
+        0, "setHpcsParams" },
 };
 
 static const iw_handler hostapd_private[] = {
